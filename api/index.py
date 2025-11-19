@@ -195,6 +195,7 @@ def check_cedula():
 
 
 @app.route('/', methods=['GET'])
+@require_api_key
 def home():
     """
     Home endpoint with usage instructions.
