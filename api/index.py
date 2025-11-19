@@ -193,7 +193,5 @@ def home():
     }), 200
 
 
-# Vercel serverless function handler
-def handler(request):
-    with app.request_context(request.environ):
-        return app.full_dispatch_request()
+# Export the Flask app for Vercel
+# Vercel will automatically use this as a WSGI application
