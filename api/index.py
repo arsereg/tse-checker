@@ -4,6 +4,16 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify
 
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key')
+        if api_key != os.environ.get('API_KEY'):
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
 def get_tse_details_html(cedula):
     """
     Retrieves the HTML content of the TSE detailed birth information page.
@@ -163,6 +173,7 @@ def check_fallecido(cedula):
 app = Flask(__name__)
 
 @app.route('/check', methods=['GET'])
+@require_api_key
 def check_cedula():
     """
     GET endpoint to check if a person is deceased.

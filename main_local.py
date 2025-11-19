@@ -169,6 +169,7 @@ def check_cedula():
     GET endpoint to check if a person is deceased.
     Usage: /check?cedula=102920417
     """
+    
     cedula = request.args.get('cedula')
 
     if not cedula:
