@@ -7,6 +7,14 @@ from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify
 
 
+class PersonNotFound(Exception):
+    pass
+
+
+class MultipleMatches(Exception):
+    pass
+
+
 def require_api_key(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -16,180 +24,166 @@ def require_api_key(f):
         return f(*args, **kwargs)
     return decorated_function
 
-def get_tse_details_html(cedula):
+
+def _extract_state(soup):
+    out = {}
+    for name in ('__VIEWSTATE', '__VIEWSTATEGENERATOR', '__EVENTVALIDATION'):
+        el = soup.find('input', {'name': name})
+        out[name] = el['value'] if el and el.has_attr('value') else ''
+    return out
+
+
+def get_tse_details_html(nombre, apellido1, apellido2):
     """
-    Retrieves the HTML content of the TSE detailed birth information page.
+    Walks the TSE postback flow for a person looked up by name and returns
+    the detalle_nacimiento.aspx HTML (which contains lblfallecido).
 
-    Args:
-        cedula (str): The ID number to search (e.g., "102920417")
-
-    Returns:
-        str: The HTML content of the detailed page
+    Raises PersonNotFound (0 matches) or MultipleMatches (>1 matches).
     """
-
-    # Create a session with retry strategy for robustness
     session = requests.Session()
     retry = Retry(connect=3, backoff_factor=0.5)
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-CR,es;q=0.9,en;q=0.8',
+    })
 
     base_url = "https://servicioselectorales.tse.go.cr/chc"
-    search_url = f"{base_url}/consulta_cedula.aspx"
+    search_url = f"{base_url}/consulta_nombres.aspx"
+    muestra_url = f"{base_url}/muestra_nombres.aspx"
+    result_url = f"{base_url}/resultado_persona.aspx"
 
-    try:
-        # Step 1: Get initial page to extract ViewState and other hidden fields
-        print(f"Step 1: Fetching initial form from {search_url}")
-        response = session.get(search_url)
-        response.raise_for_status()
+    # Step 1: GET search form
+    print(f"Step 1: Fetching initial form from {search_url}")
+    response = session.get(search_url)
+    response.raise_for_status()
+    hidden = _extract_state(BeautifulSoup(response.content, 'html.parser'))
 
-        soup = BeautifulSoup(response.content, 'html.parser')
+    # Step 2: POST name search -> muestra_nombres.aspx
+    print(f"Step 2: Searching for {nombre} {apellido1} {apellido2}")
+    response = session.post(search_url, data={
+        '__LASTFOCUS': '',
+        '__EVENTTARGET': '',
+        '__EVENTARGUMENT': '',
+        **hidden,
+        'txtnombre': nombre,
+        'txtapellido1': apellido1,
+        'txtapellido2': apellido2,
+        'btnConsultarNombre': 'Consultar',
+        'referencia': '',
+        'observacion': '',
+    })
+    response.raise_for_status()
+    soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Extract ViewState and other ASP.NET hidden fields
-        viewstate = soup.find('input', {'name': '__VIEWSTATE'})
-        viewstategenerator = soup.find('input', {'name': '__VIEWSTATEGENERATOR'})
-        eventvalidation = soup.find('input', {'name': '__EVENTVALIDATION'})
+    # chk2 is the "select all" checkbox; chk1$N are the per-row checkboxes.
+    row_checkboxes = [
+        cb for cb in soup.find_all('input', {'type': 'checkbox'})
+        if (cb.get('name') or '').startswith('chk1$')
+    ]
+    print(f"Step 2: Found {len(row_checkboxes)} match(es)")
+    if not row_checkboxes:
+        raise PersonNotFound(
+            f"No person found matching {nombre} {apellido1} {apellido2}"
+        )
+    if len(row_checkboxes) > 1:
+        raise MultipleMatches(
+            f"Found {len(row_checkboxes)} people matching "
+            f"{nombre} {apellido1} {apellido2}; please be more specific"
+        )
 
-        hidden_fields = {
-            '__VIEWSTATE': viewstate['value'] if viewstate else '',
-            '__VIEWSTATEGENERATOR': viewstategenerator['value'] if viewstategenerator else '',
-            '__EVENTVALIDATION': eventvalidation['value'] if eventvalidation else '',
-        }
+    only_checkbox_name = row_checkboxes[0]['name']
+    hidden = _extract_state(soup)
 
-        # Step 2: Submit the search form with the cedula number
-        print(f"Step 2: Searching for cedula {cedula}")
-        search_data = {
-            'txtcedula': cedula,
-            'btnConsultaCedula': 'Consultar',
-            **hidden_fields
-        }
+    # Step 3: select the single match + click 'Realizar consulta' -> resultado_persona.aspx
+    print("Step 3: Selecting match and clicking 'Realizar consulta'")
+    response = session.post(muestra_url, data={
+        '__LASTFOCUS': '',
+        '__EVENTTARGET': '',
+        '__EVENTARGUMENT': '',
+        **hidden,
+        only_checkbox_name: 'on',
+        'Button1': 'Realizar consulta',
+    })
+    response.raise_for_status()
+    hidden = _extract_state(BeautifulSoup(response.content, 'html.parser'))
 
-        response = session.post(search_url, data=search_data)
-        response.raise_for_status()
-
-        # Step 3: Parse the results page and extract ViewState again
-        print("Step 3: Parsing results page")
-        soup = BeautifulSoup(response.content, 'html.parser')
-
-        # Extract new ViewState from results page
-        viewstate = soup.find('input', {'name': '__VIEWSTATE'})
-        viewstategenerator = soup.find('input', {'name': '__VIEWSTATEGENERATOR'})
-        eventvalidation = soup.find('input', {'name': '__EVENTVALIDATION'})
-
-        new_hidden_fields = {
-            '__VIEWSTATE': viewstate['value'] if viewstate else '',
-            '__VIEWSTATEGENERATOR': viewstategenerator['value'] if viewstategenerator else '',
-            '__EVENTVALIDATION': eventvalidation['value'] if eventvalidation else '',
-        }
-
-        # Step 4: Click "Ver Más Detalles" (LinkButton11)
-        print("Step 4: Clicking 'Ver Más Detalles' link")
-        result_url = f"{base_url}/resultado_persona.aspx"
-
-        details_data = {
-            '__EVENTTARGET': 'LinkButton11',
-            '__EVENTARGUMENT': '',
-            **new_hidden_fields
-        }
-
-        response = session.post(result_url, data=details_data)
-        response.raise_for_status()
-
-        # Step 5: Get the detailed page
-        print("Step 5: Retrieved detailed information page")
-        details_html = response.text
-
-        return details_html
-
-    except requests.RequestException as e:
-        print(f"Error during request: {e}")
-        raise
-    except Exception as e:
-        print(f"Error processing response: {e}")
-        raise
+    # Step 4: click 'Ver Más Detalles' -> detalle_nacimiento.aspx
+    print("Step 4: Clicking 'Ver Más Detalles' link")
+    response = session.post(result_url, data={
+        '__EVENTTARGET': 'LinkButton11',
+        '__EVENTARGUMENT': '',
+        **hidden,
+    })
+    response.raise_for_status()
+    return response.text
 
 
-def parse_details_from_html(html_content):
+def check_fallecido(nombre, apellido1, apellido2):
     """
-    Parses the detailed information from the HTML content.
+    Checks if a person is deceased based on their full name.
 
-    Args:
-        html_content (str): The HTML content of the details page
-
-    Returns:
-        dict: Dictionary containing extracted information
-    """
-    soup = BeautifulSoup(html_content, 'html.parser')
-
-    details = {}
-
-    # Find all labels and their corresponding values
-    labels = soup.find_all('td', class_='label')
-    for label in labels:
-        label_text = label.get_text(strip=True)
-        # Try to find the next td that contains the value
-        next_td = label.find_next('td')
-        if next_td:
-            value = next_td.get_text(strip=True)
-            details[label_text] = value
-
-    return details
-
-
-def check_fallecido(cedula):
-    """
-    Checks if a person is deceased based on their cedula.
-
-    Args:
-        cedula (str): The ID number to search
-
-    Returns:
-        dict: Dictionary with 'fallecido' key (True/False) or error information
+    Returns a dict with either {'fallecido', 'cedula'} on success or
+    {'error', 'code'} on failure. The 'code' field is one of:
+    'not_found', 'ambiguous', 'parse_error', 'unknown'.
     """
     try:
-        # Retrieve the HTML
-        html_content = get_tse_details_html(cedula)
-
-        # Parse the HTML to extract the fallecido value
+        html_content = get_tse_details_html(nombre, apellido1, apellido2)
         soup = BeautifulSoup(html_content, 'html.parser')
+
         fallecido_span = soup.find('span', {'id': 'lblfallecido'})
+        if not fallecido_span:
+            return {"error": "Could not find 'lblfallecido' element in HTML",
+                    "code": "parse_error"}
 
-        if fallecido_span:
-            fallecido_value = fallecido_span.get_text(strip=True).upper()
+        value = fallecido_span.get_text(strip=True).upper()
+        cedula_span = soup.find('span', {'id': 'lblcedula'})
+        cedula = cedula_span.get_text(strip=True) if cedula_span else None
 
-            # Return TRUE if "SI", FALSE if "NO"
-            if fallecido_value == "SI":
-                return {"fallecido": True, "cedula": cedula}
-            elif fallecido_value == "NO":
-                return {"fallecido": False, "cedula": cedula}
-            else:
-                return {"error": f"Unknown value for Fallecido/a: {fallecido_value}"}
-        else:
-            return {"error": "Could not find 'lblfallecido' element in HTML"}
+        if value == "SI":
+            return {"fallecido": True, "cedula": cedula}
+        if value == "NO":
+            return {"fallecido": False, "cedula": cedula}
+        return {"error": f"Unknown value for Fallecido/a: {value}",
+                "code": "parse_error"}
 
+    except PersonNotFound as e:
+        return {"error": str(e), "code": "not_found"}
+    except MultipleMatches as e:
+        return {"error": str(e), "code": "ambiguous"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "code": "unknown"}
 
 
-# Create Flask app
 app = Flask(__name__)
+
 
 @app.route('/check', methods=['GET'])
 @require_api_key
 def check_cedula():
     """
-    GET endpoint to check if a person is deceased.
-    Usage: /check?cedula=102920417
+    GET /check?nombre=Nora&apellido1=Perez&apellido2=Centeno
     """
-    cedula = request.args.get('cedula')
+    nombre = request.args.get('nombre')
+    apellido1 = request.args.get('apellido1')
+    apellido2 = request.args.get('apellido2')
 
-    if not cedula:
-        return jsonify({"error": "Missing 'cedula' parameter"}), 400
+    missing = [n for n, v in [
+        ('nombre', nombre), ('apellido1', apellido1), ('apellido2', apellido2)
+    ] if not v]
+    if missing:
+        return jsonify({"error": f"Missing required parameter(s): {', '.join(missing)}"}), 400
 
-    result = check_fallecido(cedula)
+    result = check_fallecido(nombre, apellido1, apellido2)
 
     if "error" in result:
-        return jsonify(result), 500
+        status_by_code = {"not_found": 404, "ambiguous": 409}
+        return jsonify(result), status_by_code.get(result.get("code"), 500)
 
     return jsonify(result), 200
 
@@ -197,13 +191,10 @@ def check_cedula():
 @app.route('/', methods=['GET'])
 @require_api_key
 def home():
-    """
-    Home endpoint with usage instructions.
-    """
     return jsonify({
         "message": "TSE Cedula Checker API",
-        "usage": "GET /check?cedula=<cedula_number>",
-        "example": "/check?cedula=102920417"
+        "usage": "GET /check?nombre=<nombre>&apellido1=<apellido1>&apellido2=<apellido2>",
+        "example": "/check?nombre=Nora&apellido1=Perez&apellido2=Centeno"
     }), 200
 
 
